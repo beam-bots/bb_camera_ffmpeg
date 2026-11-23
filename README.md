@@ -71,7 +71,8 @@ end
 ## Limitations
 
 - **Raw video only.** ffmpeg must write `-f rawvideo` to `pipe:1`, at a size
-  and pixel format the arguments force (`-vf scale=W:H,format=yuv420p`), and
+  and pixel format the arguments force
+  (`-vf scale=W:H:out_range=full,format=yuv420p -fps_mode passthrough`), and
   the driver must say how many bytes one frame takes. Raw video carries no
   description of itself, and nothing else reads ffmpeg's stdout, so there is
   nothing to resynchronise on if either is wrong.

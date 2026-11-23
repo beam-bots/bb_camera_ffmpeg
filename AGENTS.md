@@ -84,8 +84,11 @@ no markers and no header. That only works if the stream is exact from its
 first byte - which is why the backend leaves ffmpeg's stderr alone rather than
 merging it into stdout - and if `frame_bytes` is right. ffmpeg doesn't say on
 stdout what it is writing, so the driver forces the output's size and pixel
-format in the argument vector (`-vf scale=W:H,format=yuv420p`) and computes
-`frame_bytes` from them. There used to be a structural JPEG scanner here; raw
+format in the argument vector (`-vf scale=W:H:out_range=full,format=yuv420p`)
+and computes `frame_bytes` from them. `-fps_mode passthrough` belongs with it:
+without it, ffmpeg's default output mode duplicates frames to fill gaps when
+the source skips, and each duplicate would reach the hub as a new frame with a
+new timestamp. There used to be a structural JPEG scanner here; raw
 frames made it, and its resynchronisation, unnecessary.
 
 **Capture is confirmed on the first whole frame.** `Capture` holds its first

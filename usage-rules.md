@@ -39,7 +39,8 @@ specific to running a capture.
     executable: ffmpeg,
     args: [
       "-nostdin", "-f", "v4l2", "-video_size", "1280x720", "-i", "/dev/video0",
-      "-vf", "scale=1280:720,format=yuv420p", "-f", "rawvideo", "pipe:1"
+      "-vf", "scale=1280:720:out_range=full,format=yuv420p",
+      "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1"
     ],
     frame_bytes: frame_bytes,
     sequence_start: state.sequence,
