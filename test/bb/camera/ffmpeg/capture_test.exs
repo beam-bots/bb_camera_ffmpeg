@@ -7,9 +7,27 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
   use ExUnit.Case, async: true
 
   alias BB.Camera.FFmpeg.Capture
-  alias BB.Camera.FFmpeg.Test.{JpegBuilder, StubBackend}
+  alias BB.Camera.FFmpeg.Test.StubBackend
 
-  @args ["-nostdin", "-f", "lavfi", "-i", "testsrc2", "-f", "mjpeg", "pipe:1"]
+  @args [
+    "-nostdin",
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc2=size=16x8",
+    "-f",
+    "rawvideo",
+    "-pix_fmt",
+    "yuv420p",
+    "pipe:1"
+  ]
+
+  # Big enough to be a reference-counted binary, like a real frame.
+  @frame_bytes 256
+
+  # A frame filled with `label`, so a test can tell which one it was handed by
+  # matching `%{data: <<label, _::binary>>}`.
+  defp raw(label), do: :binary.copy(<<label>>, @frame_bytes)
 
   defp start_capture(opts \\ []) do
     test = self()
@@ -28,6 +46,7 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
         backend: StubBackend,
         backend_opts: [report_to: test],
         executable: "/usr/bin/ffmpeg",
+        frame_bytes: @frame_bytes,
         notify: test,
         sink: sink
       ]
@@ -53,37 +72,33 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
   end
 
   describe "framing" do
-    test "delivers a frame with the dimensions the image actually has" do
+    test "delivers a whole frame, stamped and numbered" do
       %{stub: stub} = start_capture()
-      image = JpegBuilder.build(width: 1280, height: 720)
 
-      :ok = StubBackend.feed(stub, image)
+      :ok = StubBackend.feed(stub, raw(1))
 
       assert_receive {:frame, frame}
-      assert frame.data == image
-      assert frame.width == 1280
-      assert frame.height == 720
+      assert frame.data == raw(1)
       assert frame.sequence == 0
       assert is_integer(frame.monotonic_time)
       assert is_integer(frame.wall_time)
-      assert frame.metadata.components == 3
     end
 
     test "reassembles a frame split across reads" do
       %{stub: stub} = start_capture()
-      image = JpegBuilder.build(entropy: :crypto.strong_rand_bytes(2048))
+      <<first::binary-size(100), second::binary-size(100), third::binary>> = raw(7)
 
-      :ok = StubBackend.feed_all(stub, JpegBuilder.chunks(image, 100))
+      :ok = StubBackend.feed_all(stub, [first, second, third])
 
       assert_receive {:frame, frame}
-      assert frame.data == image
+      assert frame.data == raw(7)
     end
 
     test "numbers frames consecutively" do
       %{stub: stub} = start_capture()
 
       for index <- 0..3 do
-        :ok = StubBackend.feed(stub, JpegBuilder.build(width: 16 + index, height: 16))
+        :ok = StubBackend.feed(stub, raw(index))
         assert_receive {:frame, frame}
         assert frame.sequence == index
       end
@@ -92,36 +107,22 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
     test "starts numbering where a previous capture left off" do
       %{stub: stub} = start_capture(sequence_start: 97)
 
-      :ok = StubBackend.feed(stub, JpegBuilder.build())
+      :ok = StubBackend.feed(stub, raw(1))
 
       assert_receive {:frame, frame}
       assert frame.sequence == 97
     end
 
-    test "reports discarded bytes without reporting their contents" do
-      %{stub: stub, capture: capture} = start_capture()
-      garbage = :binary.copy(<<0x42>>, 64)
-
-      :ok = StubBackend.feed(stub, garbage <> JpegBuilder.build())
-
-      assert_receive {:bb_camera_ffmpeg, ^capture, {:discarded, 64, :desynchronised}}
-      assert_receive {:frame, _frame}
-      assert Capture.stats(capture).discarded_bytes == 64
-    end
-
     test "delivers only the newest frame from a read that held several" do
       %{stub: stub, capture: capture} = start_capture()
 
-      images = for size <- [16, 32, 64], do: JpegBuilder.build(width: size, height: size)
-
-      :ok = StubBackend.feed(stub, JpegBuilder.stream(images))
+      :ok = StubBackend.feed(stub, raw(16) <> raw(32) <> raw(64))
 
       assert_receive {:bb_camera_ffmpeg, ^capture, {:dropped, 2}}
-      assert_receive {:frame, frame}
-      assert frame.width == 64
+      assert_receive {:frame, %{data: <<64, _::binary>>}}
 
       refute_received {:frame, _other}
-      assert Capture.stats(capture) == %{frames: 1, dropped: 2, discarded_bytes: 0}
+      assert Capture.stats(capture) == %{frames: 1, dropped: 2}
     end
   end
 
@@ -129,8 +130,8 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
     test "holds frames until capture has been confirmed" do
       %{stub: stub, capture: capture} = start_capture(hold: true)
 
-      :ok = StubBackend.feed(stub, JpegBuilder.build(width: 16, height: 16))
-      assert_receive {:bb_camera_ffmpeg, ^capture, {:ready, %{width: 16}}}
+      :ok = StubBackend.feed(stub, raw(16))
+      assert_receive {:bb_camera_ffmpeg, ^capture, :ready}
 
       # Pushing a call through proves the read has been handled, so an empty
       # mailbox here means the frame is being held rather than merely late.
@@ -138,19 +139,19 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
       refute_received {:frame, _frame}
 
       :ok = Capture.go(capture)
-      assert_receive {:frame, %{width: 16}}
+      assert_receive {:frame, %{data: <<16, _::binary>>}}
     end
 
     test "delivers the newest held frame and nothing staler" do
       %{stub: stub, capture: capture} = start_capture(hold: true)
 
-      for size <- [16, 32, 48] do
-        :ok = StubBackend.feed(stub, JpegBuilder.build(width: size, height: size))
+      for label <- [16, 32, 48] do
+        :ok = StubBackend.feed(stub, raw(label))
       end
 
       :ok = Capture.go(capture)
 
-      assert_receive {:frame, %{width: 48}}
+      assert_receive {:frame, %{data: <<48, _::binary>>}}
       refute_received {:frame, _other}
     end
   end
@@ -158,8 +159,7 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
   describe "flow control" do
     test "acknowledges every read with its size" do
       %{stub: stub} = start_capture()
-      image = JpegBuilder.build(entropy: :crypto.strong_rand_bytes(300))
-      [first, second] = JpegBuilder.chunks(image, div(byte_size(image), 2) + 1)
+      <<first::binary-size(129), second::binary>> = raw(1)
 
       :ok = StubBackend.feed_all(stub, [first, second])
 
@@ -171,12 +171,10 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
 
     test "acknowledges a read even while the frame in it is held" do
       %{stub: stub} = start_capture(hold: true)
-      image = JpegBuilder.build()
-      size = byte_size(image)
 
-      :ok = StubBackend.feed(stub, image)
+      :ok = StubBackend.feed(stub, raw(1))
 
-      assert_receive {:stub_acked, ^stub, ^size}
+      assert_receive {:stub_acked, ^stub, @frame_bytes}
     end
 
     test "sheds frames while reads are waiting, and resumes after" do
@@ -185,7 +183,7 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
       # Only the first frame holds the capture up; the rest go straight through,
       # so what happens next depends on the backlog and nothing else.
       gate = fn
-        %{width: 16} = frame ->
+        %{data: <<16, _::binary>>} = frame ->
           send(test, {:frame, frame})
           receive do: (:release -> :ok)
 
@@ -196,12 +194,12 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
 
       %{stub: stub, capture: capture} = start_capture(sink: gate, drop_queue_len: 1)
 
-      :ok = StubBackend.feed(stub, JpegBuilder.build(width: 16, height: 16))
-      assert_receive {:frame, %{width: 16}}
+      :ok = StubBackend.feed(stub, raw(16))
+      assert_receive {:frame, %{data: <<16, _::binary>>}}
 
       # The capture is blocked inside the sink, so these pile up behind it.
-      for size <- [32, 48, 64, 80] do
-        :ok = StubBackend.feed(stub, JpegBuilder.build(width: size, height: size))
+      for label <- [32, 48, 64, 80] do
+        :ok = StubBackend.feed(stub, raw(label))
       end
 
       send(capture, :release)
@@ -210,7 +208,7 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
 
       # The last read, with nothing queued behind it, is delivered rather than
       # shed.
-      assert_receive {:frame, %{width: 80}}
+      assert_receive {:frame, %{data: <<80, _::binary>>}}
       assert Capture.stats(capture).dropped > 0
     end
   end
@@ -238,11 +236,9 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
       assert_receive {:stub_stop_requested, ^stub}
 
       # MuonTrap will not exit with acknowledgements outstanding.
-      image = JpegBuilder.build()
-      size = byte_size(image)
-      :ok = StubBackend.feed(stub, image)
+      :ok = StubBackend.feed(stub, raw(1))
 
-      assert_receive {:stub_acked, ^stub, ^size}
+      assert_receive {:stub_acked, ^stub, @frame_bytes}
     end
 
     test "asks only once however often it is told to stop" do
@@ -298,7 +294,7 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
     test "reports a sink that refuses a frame" do
       %{stub: stub, capture: capture} = start_capture(sink: fn _frame -> {:error, :too_stale} end)
 
-      :ok = StubBackend.feed(stub, JpegBuilder.build())
+      :ok = StubBackend.feed(stub, raw(1))
 
       assert_receive {:bb_camera_ffmpeg, ^capture, {:sink_error, :too_stale}}
     end
@@ -324,7 +320,7 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
     test "is disarmed by a first frame" do
       %{stub: stub, capture: capture} = start_capture()
 
-      :ok = StubBackend.feed(stub, JpegBuilder.build())
+      :ok = StubBackend.feed(stub, raw(1))
       assert_receive {:frame, _frame}
 
       # Deliver the timer's message now rather than waiting for it.

@@ -15,30 +15,40 @@ specific to running a capture.
 ## Core principles
 
 1. **The driver owns the argument vector.** This package runs whatever it is
-   given, as long as it includes `-nostdin` and writes `-f mjpeg` to
-   `pipe:1`.
+   given, as long as it includes `-nostdin` and writes `-f rawvideo` to
+   `pipe:1` at a size and pixel format it forces.
 2. **One capture per camera.** Start a `BB.Camera.FFmpeg.Capture` when the hub
    asks for capture, stop it when the hub says the last consumer left. Never a
    second one while the first is stopping.
-3. **Confirm before delivering.** Wait for `{:ready, info}`, tell the hub,
-   then call `Capture.go/1`.
-4. **An exit is the only proof the camera is free.** Monitor the capture and
+3. **Confirm before delivering.** Wait for `:ready`, tell the hub, then call
+   `Capture.go/1`.
+4. **`:frame_bytes` must match the arguments.** Compute it from the size and
+   pixel format the arguments force (`BB.Camera.Format.frame_size/3`), not
+   from what the camera was asked for. A wrong value doesn't fail; it frames
+   every frame from the wrong place.
+5. **An exit is the only proof the camera is free.** Monitor the capture and
    wait for it to go before starting the next one.
 
 ## Wiring it in
 
 ```elixir
+{:ok, frame_bytes} = BB.Camera.Format.frame_size({:raw, :I420}, 1280, 720)
+
 {:ok, capture} =
   BB.Camera.FFmpeg.Capture.start_link(
     executable: ffmpeg,
-    args: ["-nostdin", "-f", "v4l2", "-i", "/dev/video0", "-c:v", "copy", "-f", "mjpeg", "pipe:1"],
+    args: [
+      "-nostdin", "-f", "v4l2", "-video_size", "1280x720", "-i", "/dev/video0",
+      "-vf", "scale=1280:720,format=yuv420p", "-f", "rawvideo", "pipe:1"
+    ],
+    frame_bytes: frame_bytes,
     sequence_start: state.sequence,
     sink: fn frame -> BB.Camera.Hub.deliver(hub, to_bb_frame(frame)) end
   )
 
 receive do
-  {:bb_camera_ffmpeg, ^capture, {:ready, info}} ->
-    BB.Camera.Hub.capture_started(hub, stream_info_from(info))
+  {:bb_camera_ffmpeg, ^capture, :ready} ->
+    BB.Camera.Hub.capture_started(hub, stream_info)
     BB.Camera.FFmpeg.Capture.go(capture)
 end
 ```
@@ -62,9 +72,9 @@ crash of its own.
 | Option | Default | |
 |---|---|---|
 | `:executable`, `:args` | — | Required |
+| `:frame_bytes` | — | Required. The size of one frame of the raw video the arguments produce |
 | `:sink` | — | Required. Called inline; a synchronous sink is the delivery bound |
 | `:sequence_start` | `0` | Keep counting across restarts; the hub rejects a sequence that goes back |
-| `:max_frame_bytes` | 4 MiB | Largest frame before resynchronising |
 | `:drop_queue_len` | `8` | Shed frames while more reads than this are waiting |
 | `:stdio_window` | 256 KiB | Unacknowledged bytes ffmpeg may have in flight |
 | `:start_timeout_ms` | `10000` | Give up when no frame has arrived |
@@ -86,6 +96,6 @@ crash of its own.
 
 - [bb_camera_ffmpeg docs](https://hexdocs.pm/bb_camera_ffmpeg)
 - `BB.Camera.FFmpeg.Capture` for the lifecycle, flow control and exit reasons
-- `BB.Camera.FFmpeg.Test.StubBackend` and `BB.Camera.FFmpeg.Test.JpegBuilder`
-  for testing a driver without ffmpeg or a camera
+- `BB.Camera.FFmpeg.Test.StubBackend` for testing a driver without ffmpeg or a
+  camera
 - [Writing a camera driver](https://hexdocs.pm/bb_camera/01-writing-a-camera-driver.html)
