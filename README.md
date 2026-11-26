@@ -17,7 +17,7 @@ SPDX-License-Identifier: Apache-2.0
 
 The ffmpeg capture that [Beam Bots](https://github.com/beam-bots/bb) camera
 drivers share: an ffmpeg process that cannot outlive its owner, flow-controlled
-output, and structural MJPEG framing.
+output, and framing of the raw video it writes.
 
 You do not use this package directly in a robot. A camera driver uses it:
 
@@ -26,8 +26,10 @@ You do not use this package directly in a robot. A camera driver uses it:
 - [`bb_camera_avf`](https://github.com/beam-bots/bb_camera_avf) for macOS
   cameras through AVFoundation.
 
-Each driver builds the ffmpeg argument vector for its own input. This package
-runs it, frames the output, and hands whole JPEG images to the driver.
+Each driver builds the ffmpeg argument vector for its own input, decoding
+whatever the device produces into raw video at a size and pixel format it
+forces. This package runs it, frames the output, and hands whole raw frames to
+the driver.
 
 ## What it does
 
@@ -45,9 +47,8 @@ MuonTrap ──> ffmpeg ──pipe──> Capture ──frames──> the driver
   [MuonTrap](https://hex.pm/packages/muontrap). MuonTrap kills ffmpeg when the
   port closes for any reason, including the VM halting, and forwards output
   only as fast as it is acknowledged.
-- **`BB.Camera.FFmpeg.Framer`** and **`BB.Camera.FFmpeg.Jpeg`** — split the
-  byte stream into images by walking the JPEG marker structure, not by
-  searching for `FF D9`, and read each image's real dimensions on the way past.
+- **`BB.Camera.FFmpeg.Framer`** — cuts the byte stream into frames of the
+  fixed size the driver says one frame takes.
 - **`BB.Camera.FFmpeg.FrameRate`** — exact rational frame rates, so
   `30000/1001` is not rounded to a different rate on its way to ffmpeg.
 
@@ -69,11 +70,16 @@ end
 
 ## Limitations
 
-- **MJPEG only.** ffmpeg must write `-f mjpeg` to `pipe:1`.
+- **Raw video only.** ffmpeg must write `-f rawvideo` to `pipe:1`, at a size
+  and pixel format the arguments force
+  (`-vf scale=W:H:out_range=full,format=yuv420p -fps_mode passthrough`), and
+  the driver must say how many bytes one frame takes. Raw video carries no
+  description of itself, and nothing else reads ffmpeg's stdout, so there is
+  nothing to resynchronise on if either is wrong.
 - **ffmpeg must run with `-nostdin`.** MuonTrap's flow control uses stdin, and
   ffmpeg inherits it. Without the flag, ffmpeg reads the acknowledgements as
   keyboard commands. The backend refuses to start without it.
-- **Timestamps are arrival times**, not exposure times. A raw MJPEG stream
+- **Timestamps are arrival times**, not exposure times. A raw video stream
   carries none of its own.
 - **It calls a function MuonTrap does not document**,
   `MuonTrap.Port.report_bytes_handled/2`, because MuonTrap's public API has no

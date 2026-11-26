@@ -13,7 +13,7 @@ repository.
 
 `bb_camera_ffmpeg` is the ffmpeg capture shared by Beam Bots camera drivers
 (`bb_camera_v4l`, `bb_camera_avf`). It runs an ffmpeg argument vector the
-driver supplies, frames the MJPEG output, and hands whole images to the
+driver supplies, frames the raw video it writes, and hands whole frames to the
 driver's sink. It knows nothing about any particular input, and nothing about
 `BB.Camera.Hub` beyond the documentation.
 
@@ -36,8 +36,7 @@ BB_VERSION=local mix test --include ffmpeg   # also runs ffmpeg under MuonTrap
 | `BB.Camera.FFmpeg.Capture` | Owns the backend handle, the framer and the bounds. One per running capture |
 | `BB.Camera.FFmpeg.Backend` | How capture gets bytes |
 | `BB.Camera.FFmpeg.Backend.MuonTrap` | ffmpeg under MuonTrap, behind a port |
-| `BB.Camera.FFmpeg.Framer` | Buffer, size caps, resynchronisation. A struct, no process |
-| `BB.Camera.FFmpeg.Jpeg` | Resumable structural scan of a JPEG stream. Pure |
+| `BB.Camera.FFmpeg.Framer` | Cuts the stream every `frame_bytes`. A struct, no process |
 | `BB.Camera.FFmpeg.FrameRate` | Exact rational frame rates. Pure |
 
 ## Things that are easy to get wrong
@@ -79,13 +78,22 @@ is many reads on a Mac. Measured on macOS: 90 frames at 1280x720 and
 1920x1080, 30 fps, shed 1 and 0 with the default `:drop_queue_len` of 8. If
 that changes, the signal is wrong, not the threshold.
 
-**Framing is structural, not a marker search.** `FF D9` appears inside EXIF
-thumbnails. `Jpeg` walks segment lengths and entropy-coded data. Do not
-replace it with `:binary.match/2` on the end marker.
+**Framing is by size, and nothing can resynchronise it.** ffmpeg writes raw
+video (`-f rawvideo`): frames end to end, every one `frame_bytes` long, with
+no markers and no header. That only works if the stream is exact from its
+first byte - which is why the backend leaves ffmpeg's stderr alone rather than
+merging it into stdout - and if `frame_bytes` is right. ffmpeg doesn't say on
+stdout what it is writing, so the driver forces the output's size and pixel
+format in the argument vector (`-vf scale=W:H:out_range=full,format=yuv420p`)
+and computes `frame_bytes` from them. `-fps_mode passthrough` belongs with it:
+without it, ffmpeg's default output mode duplicates frames to fill gaps when
+the source skips, and each duplicate would reach the hub as a new frame with a
+new timestamp. There used to be a structural JPEG scanner here; raw
+frames made it, and its resynchronisation, unnecessary.
 
-**Capture is confirmed on the first whole image.** `Capture` holds its first
-frame and sends `{:ready, info}`; the driver confirms to its hub and then
-releases it with `go/1`.
+**Capture is confirmed on the first whole frame.** `Capture` holds its first
+frame and sends `:ready`; the driver confirms to its hub and then releases it
+with `go/1`.
 
 **An exit status is the only proof the camera is free.** `Capture` stays
 alive until it arrives. When it does not arrive within `:stop_timeout_ms` plus
@@ -99,11 +107,9 @@ match on that.
 
 `BB.Camera.FFmpeg.Test.StubBackend` delivers exactly the bytes a test asks
 for and reports every acknowledgement, stop request and close to the test.
-`BB.Camera.FFmpeg.Test.JpegBuilder` builds structurally valid images with
-stuffed bytes, restart markers, fill bytes and embedded thumbnails on demand.
 
-Both live in `lib`, not `test/support`, against the ecosystem's usual
-practice. Every driver built on this package needs them in its own tests, and
+It lives in `lib`, not `test/support`, against the ecosystem's usual
+practice. Every driver built on this package needs it in its own tests, and
 a dependency's `test/support` is never compiled; the alternative was a copy
 in every driver.
 

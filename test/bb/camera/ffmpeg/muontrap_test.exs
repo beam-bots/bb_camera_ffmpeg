@@ -28,8 +28,10 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
     end
   end
 
-  defp lavfi_args(width, height, rate) do
-    [
+  # A test source at a forced size and pixel format, and the size of one frame
+  # of it - the same pair a driver hands `Capture`.
+  defp lavfi(width, height, rate) do
+    args = [
       "-nostdin",
       "-hide_banner",
       "-loglevel",
@@ -40,19 +42,19 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
       "-i",
       "testsrc2=size=#{width}x#{height}:rate=#{rate}",
       "-an",
-      "-c:v",
-      "mjpeg",
-      "-q:v",
-      "5",
+      "-vf",
+      "scale=#{width}:#{height},format=yuv420p",
       "-f",
-      "mjpeg",
+      "rawvideo",
       "-flush_packets",
       "1",
       "pipe:1"
     ]
+
+    {args, div(width * height * 3, 2)}
   end
 
-  defp start_capture(executable, args, opts \\ []) do
+  defp start_capture(executable, {args, frame_bytes}, opts \\ []) do
     test = self()
 
     sink = fn frame ->
@@ -62,7 +64,9 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
 
     capture =
       start_supervised!(
-        {Capture, [executable: executable, args: args, notify: test, sink: sink] ++ opts},
+        {Capture,
+         [executable: executable, args: args, frame_bytes: frame_bytes, notify: test, sink: sink] ++
+           opts},
         id: :capture,
         restart: :temporary
       )
@@ -72,16 +76,14 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
     capture
   end
 
-  test "captures real JPEG frames", %{ffmpeg: ffmpeg} do
-    capture = start_capture(ffmpeg, lavfi_args(320, 240, 10))
+  test "captures real raw frames", %{ffmpeg: ffmpeg} do
+    capture = start_capture(ffmpeg, lavfi(320, 240, 10))
 
     # ffmpeg takes a moment to start; the bound is generous because it is an
     # upper bound on an event that must happen, not an estimate.
     assert_receive {:frame, first}, 20_000
 
-    assert {first.width, first.height} == {320, 240}
-    assert <<0xFF, 0xD8, _rest::binary>> = first.data
-    assert binary_part(first.data, byte_size(first.data) - 2, 2) == <<0xFF, 0xD9>>
+    assert byte_size(first.data) == div(320 * 240 * 3, 2)
 
     assert_receive {:frame, second}, 20_000
     assert second.sequence > first.sequence
@@ -92,15 +94,19 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
   test "frames keep coming through a window smaller than one frame", %{ffmpeg: ffmpeg} do
     # Each frame needs many acknowledgements to get through, so this fails if
     # any read goes unacknowledged.
-    capture = start_capture(ffmpeg, lavfi_args(640, 480, 10), stdio_window: 1024)
+    capture = start_capture(ffmpeg, lavfi(640, 480, 10), stdio_window: 1024)
+    frame_bytes = div(640 * 480 * 3, 2)
 
-    for _ <- 1..3, do: assert_receive({:frame, %{width: 640}}, 20_000)
+    for _ <- 1..3 do
+      assert_receive {:frame, %{data: data}}, 20_000
+      assert byte_size(data) == frame_bytes
+    end
 
     assert Capture.stats(capture).frames >= 3
   end
 
   test "stopping leaves no ffmpeg behind", %{ffmpeg: ffmpeg} do
-    capture = start_capture(ffmpeg, lavfi_args(160, 120, 10))
+    capture = start_capture(ffmpeg, lavfi(160, 120, 10))
     assert_receive {:frame, _frame}, 20_000
 
     ffmpeg_pid = ffmpeg_pid(capture)
@@ -118,7 +124,7 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
   end
 
   test "killing the capture outright still leaves no ffmpeg behind", %{ffmpeg: ffmpeg} do
-    capture = start_capture(ffmpeg, lavfi_args(160, 120, 10))
+    capture = start_capture(ffmpeg, lavfi(160, 120, 10))
     assert_receive {:frame, _frame}, 20_000
 
     ffmpeg_pid = ffmpeg_pid(capture)
@@ -132,7 +138,7 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
   end
 
   test "an ffmpeg that cannot be started fails rather than hanging" do
-    capture = start_capture("/nonexistent/ffmpeg", lavfi_args(160, 120, 10))
+    capture = start_capture("/nonexistent/ffmpeg", lavfi(160, 120, 10))
 
     Process.unlink(capture)
     monitor = Process.monitor(capture)
@@ -144,7 +150,8 @@ defmodule BB.Camera.FFmpeg.MuonTrapTest do
   end
 
   test "an argument vector without -nostdin is refused", %{ffmpeg: ffmpeg} do
-    args = List.delete(lavfi_args(160, 120, 10), "-nostdin")
+    {args, _frame_bytes} = lavfi(160, 120, 10)
+    args = List.delete(args, "-nostdin")
 
     assert {:error, :stdin_not_disabled} =
              Backend.MuonTrap.open(ffmpeg, args, stdio_window: 1024, stop_timeout_ms: 500)

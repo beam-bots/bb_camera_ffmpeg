@@ -17,8 +17,11 @@ defmodule BB.Camera.FFmpeg.Capture do
   reading the message asking it to stop.
 
   The driver supplies the ffmpeg argument vector; this module neither knows nor
-  cares which input it names. It must include `-nostdin` and write MJPEG to
-  `pipe:1` — see `BB.Camera.FFmpeg.Backend.MuonTrap`.
+  cares which input it names. It must include `-nostdin` and write raw video
+  (`-f rawvideo`) to `pipe:1` — see `BB.Camera.FFmpeg.Backend.MuonTrap`. Raw
+  video doesn't describe itself, so the argument vector must also force the
+  output's size and pixel format, and `:frame_bytes` must be what one frame of
+  that takes; see `BB.Camera.FFmpeg.Framer`.
 
   ## Bounding ingress
 
@@ -36,14 +39,14 @@ defmodule BB.Camera.FFmpeg.Capture do
   below the threshold. Within a single read, likewise, only the newest frame is
   delivered.
 
-  `:max_frame_bytes` bounds the framer's buffer, so memory held here is at most
+  The framer holds at most one partial frame, so memory held here is at most
   one window plus one frame.
 
   ## Confirming capture
 
-  ffmpeg starting says only that ffmpeg exists. The first whole image is the
-  evidence that the camera opened, so it is held, the owner is sent
-  `{:ready, info}`, and nothing reaches the sink until the owner calls `go/1`.
+  ffmpeg starting says only that ffmpeg exists. The first whole frame is the
+  evidence that the camera opened, so it is held, the owner is sent `:ready`,
+  and nothing reaches the sink until the owner calls `go/1`.
 
   An ffmpeg that never produces a first frame is stopped after
   `:start_timeout_ms`, and the capture exits `{:shutdown, {:no_frames, ms}}`.
@@ -66,10 +69,10 @@ defmodule BB.Camera.FFmpeg.Capture do
   camera's own pipeline, the OS's capture buffers, ffmpeg, MuonTrap, the pipe,
   and the BEAM's scheduler.
 
-  Nothing better is available on this path: the raw MJPEG stream ffmpeg writes
-  is a bare concatenation of images with no container and therefore no
-  timestamps at all. The stamps are monotonic and in arrival order, so
-  inter-frame intervals are meaningful even though absolute times are offset.
+  Nothing better is available on this path: the raw video ffmpeg writes is a
+  bare concatenation of frames with no container and therefore no timestamps
+  at all. The stamps are monotonic and in arrival order, so inter-frame
+  intervals are meaningful even though absolute times are offset.
   """
 
   use GenServer
@@ -88,14 +91,18 @@ defmodule BB.Camera.FFmpeg.Capture do
   # the teardown is called unconfirmed.
   @teardown_margin_ms 1_000
 
+  @typedoc """
+  One frame, as handed to the sink.
+
+  Only what this module knows: the bytes, and when and in what order they
+  arrived. Format and dimensions are the driver's, since the driver forced
+  them.
+  """
   @type frame :: %{
           data: binary(),
-          width: pos_integer(),
-          height: pos_integer(),
           sequence: non_neg_integer(),
           monotonic_time: integer(),
-          wall_time: integer(),
-          metadata: map()
+          wall_time: integer()
         }
 
   @typedoc """
@@ -103,10 +110,9 @@ defmodule BB.Camera.FFmpeg.Capture do
   """
   @type event ::
           {:exited, status :: integer()}
-          | {:discarded, bytes :: pos_integer(), reason :: atom()}
           | {:dropped, frames :: pos_integer()}
           | {:sink_error, term()}
-          | {:ready, BB.Camera.FFmpeg.Jpeg.info()}
+          | :ready
           | {:no_frames, timeout_ms :: pos_integer()}
 
   @doc """
@@ -116,6 +122,8 @@ defmodule BB.Camera.FFmpeg.Capture do
 
   - `:executable` — path to ffmpeg. Required.
   - `:args` — ffmpeg's arguments, including `-nostdin`. Required.
+  - `:frame_bytes` — the size of one frame of the raw video the arguments
+    produce. Required.
   - `:sink` — a 1-arity function called with each `t:frame/0`, returning
     `:ok` or `{:error, reason}`. Called inline, so a synchronous sink is what
     bounds delivery. Required.
@@ -124,7 +132,6 @@ defmodule BB.Camera.FFmpeg.Capture do
   - `:sequence_start` — first sequence number. A camera that restarts its
     capture must keep counting up, because the hub rejects a sequence that does
     not strictly increase. Default `0`.
-  - `:max_frame_bytes` — passed to `BB.Camera.FFmpeg.Framer`.
   - `:drop_queue_len` — shed frames while more reads than this are waiting.
     Default #{@default_drop_queue_len}.
   - `:stdio_window` — bytes of output ffmpeg may have in flight before this
@@ -173,7 +180,7 @@ defmodule BB.Camera.FFmpeg.Capture do
   end
 
   @doc """
-  Counters for this capture: frames delivered, frames shed, bytes discarded.
+  Counters for this capture: frames delivered and frames shed.
   """
   @spec stats(GenServer.server()) :: map()
   def stats(capture), do: GenServer.call(capture, :stats)
@@ -208,7 +215,7 @@ defmodule BB.Camera.FFmpeg.Capture do
            backend: backend,
            drop_queue_len: Keyword.get(opts, :drop_queue_len, @default_drop_queue_len),
            failure: nil,
-           framer: Framer.new(Keyword.take(opts, [:max_frame_bytes])),
+           framer: Framer.new(Keyword.fetch!(opts, :frame_bytes)),
            handle: handle,
            notify: Keyword.fetch!(opts, :notify),
            pending: nil,
@@ -216,7 +223,7 @@ defmodule BB.Camera.FFmpeg.Capture do
            sink: Keyword.fetch!(opts, :sink),
            start_timeout_ms: start_timeout_ms,
            started: false,
-           stats: %{frames: 0, dropped: 0, discarded_bytes: 0},
+           stats: %{frames: 0, dropped: 0},
            stop_timeout_ms: stop_timeout_ms,
            stopping: false
          }}
@@ -314,11 +321,9 @@ defmodule BB.Camera.FFmpeg.Capture do
     monotonic_time = System.monotonic_time(:nanosecond)
     wall_time = System.system_time(:nanosecond)
 
-    {frames, discards, framer} = Framer.push(state.framer, chunk)
+    {frames, framer} = Framer.push(state.framer, chunk)
 
-    %{state | framer: framer}
-    |> report_discards(discards)
-    |> handle_frames(frames, queue_len, monotonic_time, wall_time)
+    handle_frames(%{state | framer: framer}, frames, queue_len, monotonic_time, wall_time)
   end
 
   defp handle_frames(state, [], _queue_len, _monotonic_time, _wall_time), do: state
@@ -340,11 +345,11 @@ defmodule BB.Camera.FFmpeg.Capture do
   defp take(%{started: true} = state, frame, monotonic_time, wall_time),
     do: deliver(state, frame, monotonic_time, wall_time)
 
-  defp take(state, {_data, info} = frame, monotonic_time, wall_time) do
+  defp take(state, frame, monotonic_time, wall_time) do
     if state.pending do
       notify(state, {:dropped, 1})
     else
-      notify(state, {:ready, info})
+      notify(state, :ready)
     end
 
     %{state | pending: {frame, monotonic_time, wall_time}}
@@ -359,19 +364,12 @@ defmodule BB.Camera.FFmpeg.Capture do
     update_in(state.stats.dropped, &(&1 + count))
   end
 
-  defp deliver(state, {data, info}, monotonic_time, wall_time) do
+  defp deliver(state, data, monotonic_time, wall_time) do
     frame = %{
       data: data,
-      width: info.width,
-      height: info.height,
       sequence: state.sequence,
       monotonic_time: monotonic_time,
-      wall_time: wall_time,
-      metadata: %{
-        components: info.components,
-        precision: info.precision,
-        progressive?: info.progressive?
-      }
+      wall_time: wall_time
     }
 
     case state.sink.(frame) do
@@ -382,14 +380,6 @@ defmodule BB.Camera.FFmpeg.Capture do
     state
     |> Map.put(:sequence, state.sequence + 1)
     |> update_in([:stats, :frames], &(&1 + 1))
-  end
-
-  defp report_discards(state, discards) do
-    Enum.reduce(discards, state, fn {:discarded, bytes, reason}, state ->
-      notify(state, {:discarded, bytes, reason})
-
-      update_in(state.stats.discarded_bytes, &(&1 + bytes))
-    end)
   end
 
   # Shed frames count: they prove ffmpeg is producing just as well as
