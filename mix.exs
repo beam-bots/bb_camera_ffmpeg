@@ -9,7 +9,7 @@ defmodule BB.Camera.FFmpeg.MixProject do
   Shared ffmpeg capture for Beam Bots camera drivers: a supervised, flow-controlled ffmpeg process and raw video framing.
   """
 
-  @version "0.1.0"
+  @version "0.2.0"
 
   def project do
     [
