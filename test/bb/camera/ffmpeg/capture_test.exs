@@ -296,6 +296,24 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
       refute Process.alive?(capture)
     end
 
+    test "a stub with nobody to report to exits when asked to stop" do
+      capture =
+        start_supervised!(
+          {Capture,
+           args: @args,
+           backend: StubBackend,
+           backend_opts: [report_to: :nobody_is_listening],
+           executable: "/usr/bin/ffmpeg",
+           frame_bytes: @frame_bytes,
+           notify: self(),
+           sink: fn _frame -> :ok end},
+          restart: :temporary
+        )
+
+      assert Capture.stop_and_wait(capture) == :ok
+      assert_received {:bb_camera_ffmpeg, ^capture, {:exited, 0}}
+    end
+
     test "stop_and_wait returns at once for a capture that has gone" do
       %{capture: capture} = start_capture()
       :ok = stop_supervised(:capture)

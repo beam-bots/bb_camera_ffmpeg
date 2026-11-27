@@ -18,6 +18,12 @@ defmodule BB.Camera.FFmpeg.Test.StubBackend do
   It reports what the capture does to it — opening, acknowledging, asking to
   stop, closing — to `:report_to`, which is a pid or a registered name.
 
+  Asked to stop with nobody left to report to - or losing its observer while
+  a stop is outstanding - it exits with status `0`, as a well-behaved program
+  would. That is the state a test's robot is torn down in, after the test
+  process has gone, and a driver that waits for its capture to exit would
+  otherwise sit out the full stop deadline.
+
   It ships in `lib`, not `test/support`, so that camera drivers built on this
   package can declare it as their backend in a test robot. A dependency's
   `test/support` is never compiled. It is for tests only.
@@ -95,7 +101,10 @@ defmodule BB.Camera.FFmpeg.Test.StubBackend do
   end
 
   def handle_call(:request_stop, _from, state) do
-    report(state.report_to, {:stub_stop_requested, self()})
+    case report(state.report_to, {:stub_stop_requested, self()}) do
+      {:reported, observer} -> Process.monitor(observer)
+      :unobserved -> exit_cleanly(state)
+    end
 
     {:reply, :ok, state}
   end
@@ -106,22 +115,37 @@ defmodule BB.Camera.FFmpeg.Test.StubBackend do
     {:reply, :ok, state}
   end
 
+  @impl GenServer
+  def handle_info({:DOWN, _monitor, :process, _observer, _reason}, state) do
+    exit_cleanly(state)
+    {:noreply, state}
+  end
+
+  defp exit_cleanly(state), do: send(state.owner, {self(), {:exit_status, 0}})
+
   defp call_if_alive(stub, message) do
     GenServer.call(stub, message)
   catch
     :exit, _reason -> :ok
   end
 
-  defp report(nil, _message), do: :ok
+  defp report(nil, _message), do: :unobserved
 
   # A robot's DSL is compiled before the test process exists, so a stub
   # declared in one reports to a registered name rather than a pid.
   defp report(name, message) when is_atom(name) do
     case Process.whereis(name) do
-      nil -> :ok
-      pid -> send(pid, message)
+      nil -> :unobserved
+      pid -> report(pid, message)
     end
   end
 
-  defp report(pid, message) when is_pid(pid), do: send(pid, message)
+  defp report(pid, message) when is_pid(pid) do
+    if Process.alive?(pid) do
+      send(pid, message)
+      {:reported, pid}
+    else
+      :unobserved
+    end
+  end
 end
