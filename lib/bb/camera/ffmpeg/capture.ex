@@ -62,6 +62,11 @@ defmodule BB.Camera.FFmpeg.Capture do
   MuonTrap kill ffmpeg, and exits `{:shutdown, :teardown_unconfirmed}` so the
   owner knows the camera may still be held.
 
+  A sink that exits - a hub that died while a frame was on its way to it - is
+  stopped the same way. Nothing more is handed to the sink, and once the exit
+  status arrives the capture exits `{:shutdown, {:sink_exited, reason}}`, or
+  `{:shutdown, :teardown_unconfirmed}` if it never does.
+
   ## Timestamps, honestly
 
   A frame is stamped when the read that completed it arrived in this process.
@@ -126,7 +131,7 @@ defmodule BB.Camera.FFmpeg.Capture do
     produce. Required.
   - `:sink` — a 1-arity function called with each `t:frame/0`, returning
     `:ok` or `{:error, reason}`. Called inline, so a synchronous sink is what
-    bounds delivery. Required.
+    bounds delivery. A sink that exits stops the capture. Required.
   - `:notify` — process to send `t:event/0`s to, tagged
     `{:bb_camera_ffmpeg, capture_pid, event}`. Default the starting process.
   - `:sequence_start` — first sequence number. A camera that restarts its
@@ -364,6 +369,9 @@ defmodule BB.Camera.FFmpeg.Capture do
     update_in(state.stats.dropped, &(&1 + count))
   end
 
+  defp deliver(%{failure: {:sink_exited, _reason}} = state, _data, _monotonic_time, _wall_time),
+    do: state
+
   defp deliver(state, data, monotonic_time, wall_time) do
     frame = %{
       data: data,
@@ -372,15 +380,39 @@ defmodule BB.Camera.FFmpeg.Capture do
       wall_time: wall_time
     }
 
-    case state.sink.(frame) do
-      :ok -> :ok
-      {:error, reason} -> notify(state, {:sink_error, reason})
-    end
+    case call_sink(state.sink, frame) do
+      :ok ->
+        delivered(state)
 
+      {:error, reason} ->
+        notify(state, {:sink_error, reason})
+        delivered(state)
+
+      {:sink_exited, reason} ->
+        sink_exited(state, reason)
+    end
+  end
+
+  # The sink is normally a synchronous call to a hub, and a hub can die. Left
+  # to crash, this process would close its port and leave the program to be
+  # killed after it had gone, with nothing waiting for the camera to be free -
+  # and a restarted driver would race the old program for the device.
+  defp call_sink(sink, frame) do
+    sink.(frame)
+  catch
+    :exit, reason -> {:sink_exited, reason}
+  end
+
+  defp delivered(state) do
     state
     |> Map.put(:sequence, state.sequence + 1)
     |> update_in([:stats, :frames], &(&1 + 1))
   end
+
+  defp sink_exited(%{stopping: true} = state, reason),
+    do: %{state | failure: {:sink_exited, reason}}
+
+  defp sink_exited(state, reason), do: begin_stop(%{state | failure: {:sink_exited, reason}})
 
   # Shed frames count: they prove ffmpeg is producing just as well as
   # delivered ones do.

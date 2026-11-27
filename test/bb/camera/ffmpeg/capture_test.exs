@@ -29,6 +29,16 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
   # matching `%{data: <<label, _::binary>>}`.
   defp raw(label), do: :binary.copy(<<label>>, @frame_bytes)
 
+  # A hub that has already died, as far as a sink calling it can tell.
+  defp dead_process do
+    pid = spawn(fn -> :ok end)
+    monitor = Process.monitor(pid)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}
+    pid
+  end
+
+  defp sink_to(hub), do: fn frame -> GenServer.call(hub, {:deliver, frame}) end
+
   defp start_capture(opts \\ []) do
     test = self()
 
@@ -297,6 +307,69 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
       :ok = StubBackend.feed(stub, raw(1))
 
       assert_receive {:bb_camera_ffmpeg, ^capture, {:sink_error, :too_stale}}
+    end
+  end
+
+  describe "a sink that exits" do
+    test "stops the program and waits for its exit before exiting itself" do
+      %{stub: stub, capture: capture} = start_capture(sink: sink_to(dead_process()))
+
+      Process.unlink(capture)
+      monitor = Process.monitor(capture)
+
+      :ok = StubBackend.feed(stub, raw(1))
+      assert_receive {:stub_stop_requested, ^stub}
+
+      # Still answering, so still waiting for the program rather than gone.
+      Capture.stats(capture)
+      refute_received {:DOWN, ^monitor, :process, ^capture, _reason}
+      refute_received {:stub_closed, ^stub}
+
+      :ok = StubBackend.exited(stub, 0)
+
+      assert_receive {:bb_camera_ffmpeg, ^capture, {:exited, 0}}
+
+      assert_receive {:DOWN, ^monitor, :process, ^capture,
+                      {:shutdown, {:sink_exited, {:noproc, _call}}}}
+    end
+
+    test "is handed nothing more, and asked to stop only once" do
+      test = self()
+      hub = dead_process()
+
+      sink = fn frame ->
+        send(test, {:frame, frame})
+        GenServer.call(hub, {:deliver, frame})
+      end
+
+      %{stub: stub, capture: capture} = start_capture(sink: sink)
+
+      :ok = StubBackend.feed(stub, raw(1))
+      assert_receive {:frame, %{data: <<1, _::binary>>}}
+      assert_receive {:stub_acked, ^stub, @frame_bytes}
+      assert_receive {:stub_stop_requested, ^stub}
+
+      :ok = StubBackend.feed(stub, raw(2))
+      Capture.stats(capture)
+
+      assert_received {:stub_acked, ^stub, @frame_bytes}
+      refute_received {:frame, _frame}
+      refute_received {:stub_stop_requested, ^stub}
+    end
+
+    test "says so when the program never confirms its exit" do
+      %{stub: stub, capture: capture} = start_capture(sink: sink_to(dead_process()))
+
+      Process.unlink(capture)
+      monitor = Process.monitor(capture)
+
+      :ok = StubBackend.feed(stub, raw(1))
+      assert_receive {:stub_stop_requested, ^stub}
+
+      send(capture, :stop_deadline)
+
+      assert_receive {:DOWN, ^monitor, :process, ^capture, {:shutdown, :teardown_unconfirmed}}
+      assert_receive {:stub_closed, ^stub}
     end
   end
 
