@@ -168,6 +168,26 @@ defmodule BB.Camera.FFmpeg.Capture do
   end
 
   @doc """
+  Stop the capture and wait until it has gone.
+
+  For a driver's `terminate/2`. A driver that exits without waiting is
+  restarted at once, and its replacement can find the old ffmpeg still holding
+  the camera. Returns once the capture has exited, which it does at most
+  `:stop_timeout_ms` plus a second after being asked, so the wait is bounded
+  without a timeout of its own. Returns at once if the capture has already
+  gone.
+  """
+  @spec stop_and_wait(pid()) :: :ok
+  def stop_and_wait(capture) do
+    monitor = Process.monitor(capture)
+    stop(capture)
+
+    receive do
+      {:DOWN, ^monitor, :process, ^capture, _reason} -> :ok
+    end
+  end
+
+  @doc """
   Let frames start flowing to the sink.
 
   A capture holds its frames until this is called, so that the hub cannot be

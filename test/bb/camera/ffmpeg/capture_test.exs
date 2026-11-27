@@ -280,6 +280,29 @@ defmodule BB.Camera.FFmpeg.CaptureTest do
       assert_receive {:stub_closed, ^stub}
     end
 
+    test "stop_and_wait returns only once the program has exited" do
+      %{stub: stub, capture: capture} = start_capture()
+
+      waiter = Task.async(fn -> Capture.stop_and_wait(capture) end)
+      assert_receive {:stub_stop_requested, ^stub}
+
+      # The capture cannot exit before the program does, so the waiter cannot
+      # have returned yet.
+      assert Task.yield(waiter, 0) == nil
+
+      :ok = StubBackend.exited(stub, 1)
+
+      assert Task.await(waiter) == :ok
+      refute Process.alive?(capture)
+    end
+
+    test "stop_and_wait returns at once for a capture that has gone" do
+      %{capture: capture} = start_capture()
+      :ok = stop_supervised(:capture)
+
+      assert Capture.stop_and_wait(capture) == :ok
+    end
+
     test "closes the backend when it is shut down from outside" do
       %{stub: stub, capture: capture} = start_capture()
 
